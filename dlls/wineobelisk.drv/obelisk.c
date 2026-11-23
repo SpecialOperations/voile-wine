@@ -605,7 +605,8 @@ static void apply_frame( HWND hwnd )
     RECT rect;
 
     pthread_mutex_lock( &win_lock );
-    if (!(win = get_win( hwnd )) || !win->frame_pending || win->minimized || win->fullscreen)
+    if (!(win = get_win( hwnd )) || !win->frame_pending || win->minimized ||
+        (win->fullscreen && (win->style & WSD_STYLE_BORDERLESS)))
     {
         if (win) win->frame_pending = FALSE;
         pthread_mutex_unlock( &win_lock );
