@@ -58,6 +58,7 @@ enum {
   WSD_SCREEN_SAVER = 33,   /* wsd_window_flag (window ignored, value: 1 the display may sleep, 0 it stays on) */
   WSD_AUDIO_OPEN_INPUT = 34, /* wsd_audio_open + 1 fd: an input stream (the default microphone) writing a shared ring */
   WSD_SET_DISPLAY_MODE = 35, /* wsd_display_mode: the size the client's game switched the display to, see PROTOCOL.md */
+  WSD_CLIPBOARD_SET = 36,    /* UTF-8 text: update the Mac's general pasteboard from the Windows clipboard */
 };
 
 /* server -> client */
@@ -80,6 +81,7 @@ enum {
   WSD_EV_ZOOM = 116,       /* wsd_window: the user pressed the zoom (green) button */
   WSD_EV_DISPLAY = 117,    /* wsd_hello_reply: the main screen changed (size, scale, refresh rate or work area) */
   WSD_EV_APP_DEACTIVATED = 118, /* no payload: another app became the active one (Cmd-Tab, a click, a link opened) */
+  WSD_EV_CLIPBOARD = 119,       /* UTF-8 text: the Mac's general pasteboard changed */
 };
 
 enum { WSD_FMT_BGRA8 = 1, WSD_FMT_RGBA8 = 2, WSD_FMT_RGB10A2 = 3 };

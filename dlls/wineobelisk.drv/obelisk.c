@@ -116,6 +116,15 @@ static UINT64 last_warp_ns;  /* last warp (SetCursorPos, end of relative mode): 
 static BOOL latency_trace;
 static BOOL keep_foreground;  /* WINE_OBELISK_KEEP_FOREGROUND, see WSD_EV_APP_DEACTIVATED */
 
+static pthread_mutex_t mac_clip_lock = PTHREAD_MUTEX_INITIALIZER;
+static char mac_clip_utf8[WSD_MAX_PAYLOAD + 1];
+static UINT mac_clip_len;
+static UINT mac_clip_seq;
+static UINT applied_clip_seq;
+static DWORD last_set_seqno;
+static HWND clip_hwnd;
+static __thread BOOL in_update_clipboard;
+
 static UINT64 now_ns(void)
 {
     struct timespec ts;
@@ -1137,6 +1146,122 @@ static void send_mouse( HWND hwnd, DWORD flags, int x, int y, DWORD data )
     NtUserSendHardwareInput( hwnd, 0, &input, 0 );
 }
 
+static void apply_mac_clipboard(void)
+{
+    char utf8[WSD_MAX_PAYLOAD + 1];
+    UINT len, seq;
+    WCHAR *wbuf;
+    DWORD wbytes = 0;
+
+    if (in_update_clipboard) return;
+
+    pthread_mutex_lock( &mac_clip_lock );
+    if (applied_clip_seq == mac_clip_seq)
+    {
+        pthread_mutex_unlock( &mac_clip_lock );
+        return;
+    }
+    len = mac_clip_len;
+    if (len > WSD_MAX_PAYLOAD) len = WSD_MAX_PAYLOAD;
+    memcpy( utf8, mac_clip_utf8, len );
+    utf8[len] = 0;
+    seq = mac_clip_seq;
+    pthread_mutex_unlock( &mac_clip_lock );
+
+    wbuf = malloc( (len + 1) * sizeof(WCHAR) );
+    if (!wbuf) return;
+    if (len) RtlUTF8ToUnicodeN( wbuf, len * sizeof(WCHAR), &wbytes, utf8, len );
+    wbuf[wbytes / sizeof(WCHAR)] = 0;
+    wbytes += sizeof(WCHAR);
+
+    in_update_clipboard = TRUE;
+    if (NtUserOpenClipboard( clip_hwnd, 0 ))
+    {
+        struct set_clipboard_params params = { .data = wbuf, .size = wbytes };
+        NtUserEmptyClipboard();
+        if (wbytes > sizeof(WCHAR))
+            NtUserSetClipboardData( CF_UNICODETEXT, 0, &params );
+        last_set_seqno = NtUserGetClipboardSequenceNumber();
+        NtUserCloseClipboard();
+
+        pthread_mutex_lock( &mac_clip_lock );
+        applied_clip_seq = seq;
+        pthread_mutex_unlock( &mac_clip_lock );
+    }
+    in_update_clipboard = FALSE;
+    free( wbuf );
+}
+
+static void OBELISK_UpdateClipboard(void)
+{
+    apply_mac_clipboard();
+}
+
+static LRESULT OBELISK_ClipboardWindowProc( HWND hwnd, UINT msg, WPARAM wp, LPARAM lp )
+{
+    switch (msg)
+    {
+    case WM_NCCREATE:
+        clip_hwnd = hwnd;
+        NtUserAddClipboardFormatListener( hwnd );
+        return TRUE;
+    case WM_CLIPBOARDUPDATE:
+    {
+        DWORD seqno;
+        struct get_clipboard_params params = { .data_only = TRUE, .size = 1024 };
+        char utf8[WSD_MAX_PAYLOAD];
+        DWORD utf8_len = 0;
+        BOOL same = FALSE;
+
+        if (in_update_clipboard) break;
+        seqno = NtUserGetClipboardSequenceNumber();
+        if (seqno == last_set_seqno) break;
+
+        in_update_clipboard = TRUE;
+        if (NtUserOpenClipboard( hwnd, 0 ))
+        {
+            for (;;)
+            {
+                if (!(params.data = malloc( params.size ))) break;
+                if (NtUserGetClipboardData( CF_UNICODETEXT, &params ))
+                {
+                    const WCHAR *wstr = params.data;
+                    size_t wchars = params.size / sizeof(WCHAR);
+                    while (wchars > 0 && wstr[wchars - 1] == 0) wchars--;
+                    if (wchars)
+                        RtlUnicodeToUTF8N( utf8, sizeof(utf8), &utf8_len, wstr, wchars * sizeof(WCHAR) );
+                    free( params.data );
+                    break;
+                }
+                free( params.data );
+                if (!params.data_size || params.data_size > 65536) break;
+                params.size = params.data_size;
+                params.data_size = 0;
+            }
+            NtUserCloseClipboard();
+        }
+        in_update_clipboard = FALSE;
+
+        pthread_mutex_lock( &mac_clip_lock );
+        if (utf8_len == mac_clip_len && !memcmp( utf8, mac_clip_utf8, utf8_len ))
+            same = TRUE;
+        else
+        {
+            memcpy( mac_clip_utf8, utf8, utf8_len );
+            mac_clip_utf8[utf8_len] = 0;
+            mac_clip_len = utf8_len;
+            applied_clip_seq = mac_clip_seq;
+        }
+        pthread_mutex_unlock( &mac_clip_lock );
+
+        if (!same)
+            wsd_send( WSD_CLIPBOARD_SET, utf8_len ? utf8 : NULL, utf8_len, NULL, 0, -1 );
+        break;
+    }
+    }
+    return NtUserMessageCall( hwnd, msg, wp, lp, NULL, NtUserDefWindowProc, FALSE );
+}
+
 static void handle_event( const struct wsd_hdr *hdr, const char *payload )
 {
     const struct wsd_window *w = (const struct wsd_window *)payload;
@@ -1145,7 +1270,7 @@ static void handle_event( const struct wsd_hdr *hdr, const char *payload )
     RECT visible = { 0 };
 
     if (hdr->type != WSD_EV_RELEASE && hdr->type != WSD_EV_PRESENTED && hdr->type != WSD_EV_ERROR &&
-        hdr->type != WSD_EV_DISPLAY && hdr->len >= 4)
+        hdr->type != WSD_EV_DISPLAY && hdr->type != WSD_EV_CLIPBOARD && hdr->len >= 4)
     {
         pthread_mutex_lock( &win_lock );
         if ((win = get_win_by_id( w->window_id )))
@@ -1344,6 +1469,18 @@ static void handle_event( const struct wsd_hdr *hdr, const char *payload )
         if (pid == GetCurrentProcessId()) NtUserCallNoParam( NtUserCallNoParam_DisplayModeChanged );
         break;
     }
+    case WSD_EV_CLIPBOARD:
+    {
+        UINT len = min( hdr->len, WSD_MAX_PAYLOAD );
+        pthread_mutex_lock( &mac_clip_lock );
+        memcpy( mac_clip_utf8, payload, len );
+        mac_clip_utf8[len] = 0;
+        mac_clip_len = len;
+        mac_clip_seq++;
+        pthread_mutex_unlock( &mac_clip_lock );
+        apply_mac_clipboard();
+        break;
+    }
     case WSD_EV_ERROR:
     {
         const struct wsd_ev_error *ev = (const void *)payload;
@@ -1454,6 +1591,7 @@ static const struct user_driver_funcs obeliskdrv_funcs =
     .pActivateWindow = OBELISK_ActivateWindow,
     .pChangeDisplaySettings = OBELISK_ChangeDisplaySettings,
     .pClipCursor = OBELISK_ClipCursor,
+    .pClipboardWindowProc = OBELISK_ClipboardWindowProc,
     .pCreateWindowSurface = OBELISK_CreateWindowSurface,
     .pDestroyCursorIcon = OBELISK_DestroyCursorIcon,
     .pDestroyWindow = OBELISK_DestroyWindow,
@@ -1462,6 +1600,7 @@ static const struct user_driver_funcs obeliskdrv_funcs =
     .pSetCursorPos = OBELISK_SetCursorPos,
     .pSetWindowText = OBELISK_SetWindowText,
     .pSystemParametersInfo = OBELISK_SystemParametersInfo,
+    .pUpdateClipboard = OBELISK_UpdateClipboard,
     .pUpdateDisplayDevices = OBELISK_UpdateDisplayDevices,
     .pWindowMessage = OBELISK_WindowMessage,
     .pWindowPosChanged = OBELISK_WindowPosChanged,
